@@ -289,6 +289,55 @@ object Loaders {
   }
 }
 
+object Builder {
+  def makeAssociations(evidences: DataFrame, cols: Seq[Column]): DataFrame = {
+    evidences
+      .groupBy(cols:_*)
+      .agg(count(col("evs_id")).as("evidence_count"),
+        slice(sort_array(collect_list(col("genetics")), false), 1, 100).as("genetics_score_list"),
+        slice(sort_array(collect_list(col("europepmc")), false), 1, 100).as("literature_score_list"))
+      .withColumn("harmonic_genetics",
+        expr(
+          """
+            |aggregate(
+            | zip_with(
+            |   genetics_score_list,
+            |   sequence(1, size(genetics_score_list)),
+            |   (e, i) -> (e / pow(i,2))
+            | ),
+            | 0D,
+            | (a, el) -> a + el
+            |)
+            |""".stripMargin))
+      .withColumn("harmonic_literature",
+        expr(
+          """
+            |aggregate(
+            | zip_with(
+            |   literature_score_list,
+            |   sequence(1, size(literature_score_list)),
+            |   (e, i) -> (e / pow(i,2))
+            | ),
+            | 0D,
+            | (a, el) -> a + el
+            |)
+            |""".stripMargin))
+      .withColumn("harmonic",
+        expr(
+          """
+            |aggregate(
+            | zip_with(
+            |   sort_array(array(harmonic_genetics, harmonic_literature * 0.2), false),
+            |   sequence(1, size(array(harmonic_genetics, harmonic_literature))),
+            |   (e, i) -> (e / pow(i,2))
+            | ),
+            | 0D,
+            | (a, el) -> a + el
+            |)
+            |""".stripMargin))
+  }
+}
+
 @main
 def main(drugFilename: String,
          targetFilename: String,
@@ -301,7 +350,8 @@ def main(drugFilename: String,
          faersByDrugFilename: String,
          faersByTargetFilename: String,
          expressionFilename: String,
-         outputPathPrefix: String): Unit = {
+         outputPathPrefix: String,
+         whitelistFilename: String = ""): Unit = {
   val sparkConf = new SparkConf()
     .set("spark.driver.maxResultSize", "0")
     .setAppName("similarities-loaders")
@@ -323,6 +373,9 @@ def main(drugFilename: String,
   val geneticsEvidences = Loaders.loadEvidencesFromGenetics(studiesFilename, predictionsFilename)
   val aesByDrug = Loaders.loadFaersByDrug(faersByDrugFilename)
   val aesByTarget = Loaders.loadFaersByTarget(faersByTargetFilename)
+
+  val whitelistDF = Option(whitelistFilename)
+    .flatMap(s => if (s.isEmpty) None else Some(s)).map(ss.read.json)
 
   /*
     building drugs + faers + aggregations (disease, drug)
@@ -383,66 +436,47 @@ def main(drugFilename: String,
     .agg(first(col("score")))
     .na.fill(0.0)
 
-  val preparedEvs = evs.join(evsScores, Seq("evs_id"), "inner")
-    .join(dfT.selectExpr("target_id", "neighbours"),
-      Seq("target_id"))
-    .withColumn("neighbour", explode(array_union(col("neighbours"), array(col("target_id")))))
-//    .join(dfD, Seq("disease_id"))
+  val associations = whitelistDF match {
+    case Some(wl) =>
+      /*
+        when whitelist happens we just want everything but not filtering
+        by score and by having some new drugs as in the case there is no
+        whitelist enabled
+       */
+      val selectedDiseases = wl.withColumn("disease_id", explode(col("whitelist"))).cache
+      val preparedEvs = evs.join(evsScores, Seq("evs_id"), "inner")
+        .join(dfT.selectExpr("target_id", "neighbours"),
+          Seq("target_id"))
+        .withColumn("neighbour", explode(array_union(col("neighbours"), array(col("target_id")))))
+        .join(selectedDiseases, Seq("disease_id"), "inner")
 
-  val associations = preparedEvs
-    .groupBy(col("neighbour").as("target_id"), col("disease_id"))
-    .agg(count(col("evs_id")).as("evidence_count"),
-      slice(sort_array(collect_list(col("genetics")), false), 1, 100).as("genetics_score_list"),
-      slice(sort_array(collect_list(col("europepmc")), false), 1, 100).as("literature_score_list"))
-    .withColumn("harmonic_genetics",
-      expr(
-        """
-          |aggregate(
-          | zip_with(
-          |   genetics_score_list,
-          |   sequence(1, size(genetics_score_list)),
-          |   (e, i) -> (e / pow(i,2))
-          | ),
-          | 0D,
-          | (a, el) -> a + el
-          |)
-          |""".stripMargin))
-    .withColumn("harmonic_literature",
-      expr(
-        """
-          |aggregate(
-          | zip_with(
-          |   literature_score_list,
-          |   sequence(1, size(literature_score_list)),
-          |   (e, i) -> (e / pow(i,2))
-          | ),
-          | 0D,
-          | (a, el) -> a + el
-          |)
-          |""".stripMargin))
-    .withColumn("harmonic",
-      expr(
-        """
-          |aggregate(
-          | zip_with(
-          |   sort_array(array(harmonic_genetics, harmonic_literature * 0.2), false),
-          |   sequence(1, size(array(harmonic_genetics, harmonic_literature))),
-          |   (e, i) -> (e / pow(i,2))
-          | ),
-          | 0D,
-          | (a, el) -> a + el
-          |)
-          |""".stripMargin))
-    .where("harmonic > 0.1")
-    .join(dfT, Seq("target_id"))
-    .join(dfD, Seq("disease_id"))
-    .withColumn("new_drugs", array_except(col("drugs_for_target.drug_id"), col("drugs_for_disease.drug_id")))
-    .withColumn("new_drugs_size", size(col("new_drugs")))
-    .where("new_drugs_size > 0")
+      Builder.makeAssociations(preparedEvs, Seq(col("neighbour").as("target_id"), col("whitelist_id")))
+        .join(selectedDiseases, Seq("whitelist_id"), "inner")
+        .join(dfT, Seq("target_id"))
+        .join(dfD, Seq("disease_id"))
+        .withColumn("new_drugs", array_except(col("drugs_for_target.drug_id"), col("drugs_for_disease.drug_id")))
+        .withColumn("new_drugs_size", size(col("new_drugs")))
+
+    case _ =>
+      val preparedEvs = evs.join(evsScores, Seq("evs_id"), "inner")
+        .join(dfT.selectExpr("target_id", "neighbours"),
+          Seq("target_id"))
+        .withColumn("neighbour", explode(array_union(col("neighbours"), array(col("target_id")))))
+
+      Builder.makeAssociations(preparedEvs, Seq(col("neighbour").as("target_id"), col("disease_id")))
+        .where("harmonic > 0.1")
+        .join(dfT, Seq("target_id"))
+        .join(dfD, Seq("disease_id"))
+        .withColumn("new_drugs", array_except(col("drugs_for_target.drug_id"), col("drugs_for_disease.drug_id")))
+        .withColumn("new_drugs_size", size(col("new_drugs")))
+        .where("new_drugs_size > 0")
+    //    .join(dfD, Seq("disease_id"))
+  }
 
   associations.write.parquet(outputPathPrefix + "/associations/")
 
-  val drugDiseaseDF = associations.selectExpr("disease_id",
+  val drugDiseaseDF = associations.selectExpr(
+    "disease_id",
     "target_id",
     "harmonic",
     "harmonic_genetics",
@@ -453,6 +487,7 @@ def main(drugFilename: String,
     "array_distinct(flatten(transform(drugs_for_disease, d -> transform(d.drug_aes, ae -> ae.drug_ae_event)))) as disease_aes_from_drugs",
     "array_distinct(flatten(drugs_for_disease.indication_ids)) as disease_indication_from_drugs",
     "array_max(drugs_for_disease.max_clinical_trial_phase) as disease_max_clinical_trial_phase_from_drugs",
+    "array_max(drugs_for_target.max_clinical_trial_phase) as target_max_clinical_trial_phase_from_drugs",
     "associated_disease_ids as associated_disease_ids_from_disease_drug_agg",
     "associated_target_ids as associated_target_ids_from_disease_drug_agg",
     "new_drugs as hypotheses"
@@ -470,7 +505,7 @@ def main(drugFilename: String,
       expr("1.0 - (size(array_except(disease_aes_from_drugs, drug_hypothesis_aes)) / size(disease_aes_from_drugs))"))
     // it needs to improve as a proper score
     .withColumn("drug_hypothesis_disease_aes_score",
-      expr("drug_hypothesis_aes_score * disease_aes_score"))
+      expr("((0.75 * drug_hypothesis_aes_score) + (0.25 * disease_aes_score)) / 1.0"))
 //    .where("drug_hypothesis_disease_aes_score > 0.0")
 
   drugDisease.write.json(outputPathPrefix + "/drug_disease/")

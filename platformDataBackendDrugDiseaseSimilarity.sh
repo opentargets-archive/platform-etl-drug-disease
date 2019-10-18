@@ -26,4 +26,5 @@ time amm platformDataBackendDrugDiseaseSimilarity.sc \
   --faersByDrugFilename "/data/drug_disease_similarity/significant_AEs_by_drug.json" \
   --faersByTargetFilename "/data/drug_disease_similarity/significant_AEs_by_target.json" \
   --expressionFilename "/data/drug_disease_similarity/19.09_expression-data.json" \
-  --outputPathPrefix "drug_disease_similarity"
+  --whitelistFilename "/data/drug_disease_similarity/whitelist.json" \
+  --outputPathPrefix "drug_disease_similarity_whitelisted"
