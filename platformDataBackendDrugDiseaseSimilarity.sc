@@ -505,8 +505,8 @@ def main(drugFilename: String,
       expr("1.0 - (size(array_except(disease_aes_from_drugs, drug_hypothesis_aes)) / size(disease_aes_from_drugs))"))
     // it needs to improve as a proper score
     .withColumn("drug_hypothesis_disease_aes_score",
-      expr("((0.75 * drug_hypothesis_aes_score) + (0.25 * disease_aes_score)) / 1.0"))
-//    .where("drug_hypothesis_disease_aes_score > 0.0")
+      expr("((0.4 * drug_hypothesis_aes_score) + (0.6 * disease_aes_score)) / 1.0"))
+    .where("drug_hypothesis_disease_aes_score > 0.0")
 
   drugDisease.write.json(outputPathPrefix + "/drug_disease/")
 
